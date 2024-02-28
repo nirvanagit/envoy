@@ -224,7 +224,7 @@ void DnsResolverImpl::AddrInfoPendingResolution::onAresGetAddrInfoCallback(
 
       int counter = 0;
       for (const ares_addrinfo_node* ai = addrinfo->nodes; ai != nullptr; ai = ai->ai_next) {
-        if (counter > 1) {
+        if (counter > 0) {
           ENVOY_LOG_EVENT(debug, "cares_aaeron", "continuing after 1 iteration");
           continue;
         }
