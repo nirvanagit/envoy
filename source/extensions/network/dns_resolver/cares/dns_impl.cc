@@ -20,24 +20,38 @@
 
 #include "absl/strings/str_join.h"
 #include "ares.h"
+#include <time.h>
+#include <unistd.h>
+#include <map>
 
 namespace Envoy {
 namespace Network {
 
-DnsResolverImpl::DnsResolverImpl(
-    const envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig& config,
-    Event::Dispatcher& dispatcher,
-    const std::vector<Network::Address::InstanceConstSharedPtr>& resolvers,
-    Stats::Scope& root_scope)
-    : dispatcher_(dispatcher),
-      timer_(dispatcher.createTimer([this] { onEventCallback(ARES_SOCKET_BAD, 0); })),
-      dns_resolver_options_(config.dns_resolver_options()),
-      use_resolvers_as_fallback_(config.use_resolvers_as_fallback()),
-      resolvers_csv_(maybeBuildResolversCsv(resolvers)),
-      filter_unroutable_families_(config.filter_unroutable_families()),
-      scope_(root_scope.createScope("dns.cares.")), stats_(generateCaresDnsResolverStats(*scope_)) {
-  AresOptions options = defaultAresOptions();
-  initializeChannel(&options.options_, options.optmask_);
+ std::string dns_resolution_cache_;
+ time_t start = time(0);
+ std::map<std::string, int> status_map_;
+ std::map<std::string, int> timeout_map_;
+ std::map<std::string, std::string> failed_dns_resolution_map_;
+ std::map<std::string, ares_addrinfo*> address_info_map_;
+ std::map<std::string, ares_addrinfo_node*> address_info_nodes_map_;
+ std::map<std::string, ares_addrinfo_cname*> address_info_cnames_map_;
+ std::map<std::string, char*> address_info_name_map_;
+
+ DnsResolverImpl::DnsResolverImpl(
+     const envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig& config,
+     Event::Dispatcher& dispatcher,
+     const std::vector<Network::Address::InstanceConstSharedPtr>& resolvers,
+     Stats::Scope& root_scope)
+     : dispatcher_(dispatcher),
+       timer_(dispatcher.createTimer([this] { onEventCallback(ARES_SOCKET_BAD, 0); })),
+       dns_resolver_options_(config.dns_resolver_options()),
+       use_resolvers_as_fallback_(config.use_resolvers_as_fallback()),
+       resolvers_csv_(maybeBuildResolversCsv(resolvers)),
+       filter_unroutable_families_(config.filter_unroutable_families()),
+       scope_(root_scope.createScope("dns.cares.")),
+       stats_(generateCaresDnsResolverStats(*scope_)) {
+   AresOptions options = defaultAresOptions();
+   initializeChannel(&options.options_, options.optmask_);
 }
 
 DnsResolverImpl::~DnsResolverImpl() {
@@ -133,34 +147,35 @@ void DnsResolverImpl::initializeChannel(ares_options* options, int optmask) {
 // Treat responses with `ARES_ENODATA` or `ARES_ENOTFOUND` status as DNS response with no records.
 // @see DnsResolverImpl::PendingResolution::onAresGetAddrInfoCallback for details.
 bool DnsResolverImpl::AddrInfoPendingResolution::isResponseWithNoRecords(int status) {
-  return status == ARES_ENODATA || status == ARES_ENOTFOUND;
+  return accept_nodata_ && (status == ARES_ENODATA || status == ARES_ENOTFOUND);
 }
 
 void DnsResolverImpl::AddrInfoPendingResolution::onAresGetAddrInfoCallback(
     int status, int timeouts, ares_addrinfo* addrinfo) {
+
+  ENVOY_LOG_EVENT(debug, "cares_aaeron", "dns_name={} status={} timeout={}", dns_name_.c_str(), static_cast<int>(status), static_cast<int>(timeouts));
   ASSERT(pending_resolutions_ > 0);
   pending_resolutions_--;
-
   parent_.stats_.resolve_total_.inc();
   parent_.stats_.pending_resolutions_.dec();
 
   if (status != ARES_SUCCESS) {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "status!=ARE_SUCCESS as status={}", status);
     parent_.chargeGetAddrInfoErrorStats(status, timeouts);
+  }
 
-    if (!isResponseWithNoRecords(status)) {
-      ENVOY_LOG_EVENT(debug, "cares_resolution_failure",
-                      "dns resolution for {} failed with c-ares status {}", dns_name_, status);
-    } else {
-      ENVOY_LOG_EVENT(debug, "cares_resolution_no_records", "dns resolution without records for {}",
-                      dns_name_);
-    }
+  if (status != ARES_SUCCESS && !isResponseWithNoRecords(status)) {
+    ENVOY_LOG_EVENT(debug, "cares_resolution_failure",
+                    "dns resolution for {} failed with c-ares status {}", dns_name_, status);
   }
 
   // We receive ARES_EDESTRUCTION when destructing with pending queries.
   if (status == ARES_EDESTRUCTION) {
     // In the destruction path we must wait until there are no more pending queries. Resolution is
     // not truly finished until the last parallel query has been destroyed.
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "status==ARES_EDESTRUCTION");
     if (pending_resolutions_ > 0) {
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "pending={} resolutions", pending_resolutions_);
       return;
     }
 
@@ -179,8 +194,8 @@ void DnsResolverImpl::AddrInfoPendingResolution::onAresGetAddrInfoCallback(
   }
 
   if (!dual_resolution_) {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "is not a dual resolution");
     completed_ = true;
-
     // If c-ares returns ARES_ECONNREFUSED and there is no fallback we assume that the channel_ is
     // broken. Mark the channel dirty so that it is destroyed and reinitialized on a subsequent call
     // to DnsResolver::resolve(). The optimal solution would be for c-ares to reinitialize the
@@ -193,88 +208,186 @@ void DnsResolverImpl::AddrInfoPendingResolution::onAresGetAddrInfoCallback(
     if (status == ARES_ECONNREFUSED) {
       parent_.dirty_channel_ = true;
     }
+  } else {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "is a dual resolution");
   }
 
   if (status == ARES_SUCCESS) {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "status==ARES_SUCCESS");
     pending_response_.status_ = ResolutionStatus::Success;
-
     if (addrinfo != nullptr && addrinfo->nodes != nullptr) {
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "addrinfo, and addrinfo->nodes are not null");
       bool can_process_v4 =
           (!parent_.filter_unroutable_families_ || available_interfaces_.v4_available_);
       bool can_process_v6 =
           (!parent_.filter_unroutable_families_ || available_interfaces_.v6_available_);
 
+      int counter = 0;
       for (const ares_addrinfo_node* ai = addrinfo->nodes; ai != nullptr; ai = ai->ai_next) {
-        if (ai->ai_family == AF_INET && can_process_v4) {
+        if (counter > 0) {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "continuing after 1 iteration");
+          continue;
+        }
+        counter++;
+        // ares_addrinfo_node *ares_addrinfo_node_store = new ares_addrinfo_node();
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "iterating over addrinfo->nodes");
+        if (ai != nullptr && ai->ai_family == AF_INET && can_process_v4) {
+          // ares_addrinfo_node_store = ai;
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "processing addrinfo.nodes for AF_INET");
           sockaddr_in address;
           memset(&address, 0, sizeof(address));
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "setting sin family to AF_INET");
           address.sin_family = AF_INET;
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "setting sin port to 0");
           address.sin_port = 0;
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "setting sin addr to ai->ai_addr");
           address.sin_addr = reinterpret_cast<sockaddr_in*>(ai->ai_addr)->sin_addr;
-
-          pending_response_.address_list_.emplace_back(
-              DnsResponse(std::make_shared<const Address::Ipv4Instance>(&address),
-                          std::chrono::seconds(ai->ai_ttl)));
-        } else if (ai->ai_family == AF_INET6 && can_process_v6) {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "adding response to pending_response");
+          pending_response_.address_list_.emplace_back( // This is where the dns response is being sent back to the caller.
+                  DnsResponse(std::make_shared<const Address::Ipv4Instance>(&address),
+                              std::chrono::seconds(ai->ai_ttl)));
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "completed adding response to pending_response");
+        } else if (ai != nullptr && ai->ai_family == AF_INET6 && can_process_v6) {
+          // ares_addrinfo_node_store = ai;
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "processing addrinfo.nodes for AF_INET6");
           sockaddr_in6 address;
           memset(&address, 0, sizeof(address));
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "setting sin family to AF_INET6");
           address.sin6_family = AF_INET6;
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "setting sin port to 0");
           address.sin6_port = 0;
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "setting sin6_addr to ai->ai_addr");
           address.sin6_addr = reinterpret_cast<sockaddr_in6*>(ai->ai_addr)->sin6_addr;
-          pending_response_.address_list_.emplace_back(
-              DnsResponse(std::make_shared<const Address::Ipv6Instance>(address),
-                          std::chrono::seconds(ai->ai_ttl)));
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "adding response to pending_response");
+          pending_response_.address_list_.emplace_back( // This is where the dns response is being sent back to the caller.
+                  DnsResponse(std::make_shared<const Address::Ipv6Instance>(address),
+                              std::chrono::seconds(ai->ai_ttl)));
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "completed adding response to pending_response");
         }
       }
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "completed response");
     }
 
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "checking if response was completed");
     if (!pending_response_.address_list_.empty() && dns_lookup_family_ != DnsLookupFamily::All) {
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "response was completed");
       completed_ = true;
     }
 
+    if (completed_ && timeouts == 0 && status == ARES_SUCCESS) {
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "updating cache for status, timeouts");
+      status_map_[dns_name_.c_str()] = status;
+      timeout_map_[dns_name_.c_str()] = timeouts;
+      if (addrinfo != nullptr) {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "updating cache for addrinfo");
+        address_info_map_[dns_name_.c_str()] = addrinfo;
+        if (addrinfo->nodes != nullptr) {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "updating cache for addrinfo->nodes");
+          address_info_nodes_map_[dns_name_.c_str()] = addrinfo->nodes;
+        }
+        if (addrinfo->cnames != nullptr) {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "updating cache for addrinfo->cnames");
+          address_info_cnames_map_[dns_name_.c_str()] = addrinfo->cnames;
+        }
+        if (addrinfo->name != nullptr) {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "updating cache for addrinfo->names");
+          address_info_name_map_[dns_name_.c_str()] = addrinfo->name;
+        }
+      } else {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "unable to update cache for addrinfo, because it was null. dns_name={}", dns_name_);
+      }
+    } else {
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting cache for dns {}", dns_name_);
+      if (status_map_.count(dns_name_.c_str())) {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting status cache for dns {}", dns_name_);
+        status_map_.erase(dns_name_.c_str());
+      }
+      if (timeout_map_.count(dns_name_.c_str())) {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting timeout cache for dns {}", dns_name_);
+        timeout_map_.erase(dns_name_.c_str());
+      }
+      if (address_info_map_.count(dns_name_.c_str())) {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting address info cache for dns {}",
+                        dns_name_);
+        address_info_map_.erase(dns_name_.c_str());
+      }
+      if (address_info_nodes_map_.count(dns_name_.c_str())) {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting node address cache for dns {}",
+                        dns_name_);
+        address_info_nodes_map_.erase(dns_name_.c_str());
+      }
+      if (address_info_cnames_map_.count(dns_name_.c_str())) {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting cnames cache for dns {}",
+                        dns_name_);
+        address_info_cnames_map_.erase(dns_name_.c_str());
+      }
+      if (address_info_name_map_.count(dns_name_.c_str())) {
+        ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting name cache for dns {}",
+                        dns_name_);
+        address_info_name_map_.erase(dns_name_.c_str());
+      }
+    }
+
     ASSERT(addrinfo != nullptr);
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "freeing addrinfo");
     ares_freeaddrinfo(addrinfo);
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
   } else if (isResponseWithNoRecords(status)) {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "got response with no records for dns={}", dns_name_);
     // Treat `ARES_ENODATA` or `ARES_ENOTFOUND` here as success to populate back the
     // "empty records" response.
+    // This is resulting into ai-family in nodes to be empty even when the status is SUCCESS. Validated via logs
     pending_response_.status_ = ResolutionStatus::Success;
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "response status=Success even when response did not have any records");
     ASSERT(addrinfo == nullptr);
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "asserting addrinfo is null");
   }
 
   if (timeouts > 0) {
-    ENVOY_LOG(debug, "DNS request timed out {} times", timeouts);
+    ENVOY_LOG(debug, "DNS request timed out {} times for {}", timeouts, dns_name_);
   }
 
   if (completed_) {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "dns resolution completed");
     finishResolve();
     // Nothing can follow a call to finishResolve due to the deletion of this object upon
     // finishResolve().
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "returning from here");
     return;
   }
 
+  ENVOY_LOG_EVENT(debug, "cares_aaeron", "checking if it was a dual resolution");
   if (dual_resolution_) {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "it was a dual resolution");
     dual_resolution_ = false;
 
     // Perform a second lookup for DnsLookupFamily::Auto and DnsLookupFamily::V4Preferred, given
     // that the first lookup failed to return any addresses. Note that DnsLookupFamily::All issues
     // both lookups concurrently so there is no need to fire a second lookup here.
     if (dns_lookup_family_ == DnsLookupFamily::Auto) {
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
       family_ = AF_INET;
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
       startResolutionImpl(AF_INET);
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
     } else if (dns_lookup_family_ == DnsLookupFamily::V4Preferred) {
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
       family_ = AF_INET6;
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
       startResolutionImpl(AF_INET6);
+      ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
     }
 
     // Note: Nothing can follow this call to getAddrInfo due to deletion of this
     // object upon synchronous resolution.
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "aaeron reached here");
     return;
   }
 }
 
 void DnsResolverImpl::PendingResolution::finishResolve() {
   ENVOY_LOG_EVENT(debug, "cares_dns_resolution_complete",
-                  "dns resolution for {} completed with status {}", dns_name_,
+                  "dns resolution for {} completed with status {} log_from_custom_dns_patch", dns_name_,
                   static_cast<int>(pending_response_.status_));
 
   if (!cancelled_) {
@@ -285,9 +398,15 @@ void DnsResolverImpl::PendingResolution::finishResolve() {
     // TODO(chaoqin-li1123): remove try catch pattern here once we figure how to handle unexpected
     // exception in fuzz tests.
     TRY_NEEDS_AUDIT {
-      callback_(pending_response_.status_, std::move(pending_response_.address_list_));
+      if (!regex_search(dns_name_, invalidDNSChars_)) {
+        ENVOY_LOG_EVENT(debug, "cares_dns_resolution_complete",
+                  "log_from_custom_dns_patch dns_name={} status={}", dns_name_,
+                  static_cast<int>(pending_response_.status_));
+        callback_(pending_response_.status_, std::move(pending_response_.address_list_));
+      } else {
+        ENVOY_LOG_EVENT(warn, "cares_dns_resolution_skipped", "log_from_custom_dns_patch found invalid dns, ignored {}", dns_name_);
+      }
     }
-    END_TRY
     catch (const EnvoyException& e) {
       ENVOY_LOG(critical, "EnvoyException in c-ares callback: {}", e.what());
       dispatcher_.post([s = std::string(e.what())] { throw EnvoyException(s); });
@@ -355,6 +474,9 @@ void DnsResolverImpl::onAresSocketStateChange(os_fd_t fd, int read, int write) {
 
 ActiveDnsQuery* DnsResolverImpl::resolve(const std::string& dns_name,
                                          DnsLookupFamily dns_lookup_family, ResolveCb callback) {
+
+  auto pending_resolution = std::make_unique<AddrInfoPendingResolution>(
+      *this, callback, dispatcher_, channel_, dns_name, dns_lookup_family);
   ENVOY_LOG_EVENT(debug, "cares_dns_resolution_start", "dns resolution for {} started", dns_name);
 
   // TODO(hennna): Add DNS caching which will allow testing the edge case of a
@@ -368,9 +490,7 @@ ActiveDnsQuery* DnsResolverImpl::resolve(const std::string& dns_name,
     initializeChannel(&options.options_, options.optmask_);
   }
 
-  auto pending_resolution = std::make_unique<AddrInfoPendingResolution>(
-      *this, callback, dispatcher_, channel_, dns_name, dns_lookup_family);
-  pending_resolution->startResolution();
+  pending_resolution->startResolution(); // TODO: possibly check if this is a duplicate entry, and its TTL hasn't expired yet.
   if (pending_resolution->completed_) {
     // Resolution does not need asynchronous behavior or network events. For
     // example, localhost lookup.
@@ -406,7 +526,9 @@ DnsResolverImpl::AddrInfoPendingResolution::AddrInfoPendingResolution(
     DnsResolverImpl& parent, ResolveCb callback, Event::Dispatcher& dispatcher,
     ares_channel channel, const std::string& dns_name, DnsLookupFamily dns_lookup_family)
     : PendingResolution(parent, callback, dispatcher, channel, dns_name),
-      dns_lookup_family_(dns_lookup_family), available_interfaces_(availableInterfaces()) {
+      dns_lookup_family_(dns_lookup_family), available_interfaces_(availableInterfaces()),
+      accept_nodata_(
+          Runtime::runtimeFeatureEnabled("envoy.reloadable_features.cares_accept_nodata")) {
   if (dns_lookup_family == DnsLookupFamily::Auto ||
       dns_lookup_family == DnsLookupFamily::V4Preferred) {
     dual_resolution_ = true;
@@ -466,6 +588,89 @@ void DnsResolverImpl::AddrInfoPendingResolution::startResolutionImpl(int family)
    * will be attempted
    */
   hints.ai_flags = ARES_AI_NOSORT;
+
+  // TODO: This calls the c-ares library for DNS resolution.
+  // Details about the function: https://c-ares.org/ares_getaddrinfo.html
+  if (strstr(dns_name_.c_str(), "internal")) {
+    if (strstr(dns_resolution_cache_.c_str(), dns_name_.c_str()) &&
+        status_map_.count(dns_name_.c_str()) &&
+        timeout_map_.count(dns_name_.c_str()) &&
+        address_info_map_.count(dns_name_.c_str()) &&
+        address_info_nodes_map_.count(dns_name_.c_str()) &&
+        address_info_name_map_.count(dns_name_.c_str())) {
+      if (status_map_[dns_name_.c_str()] == ARES_SUCCESS) {
+        // Status might be 0, because that is the default for an INT.
+        // Check the ares addr info object if it contains values
+        double seconds_since_start = difftime(time(0), start);
+        if (seconds_since_start < 60) {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "using cache for DNS response dns_name={}", dns_name_);
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "dns name {} status {} in next line", dns_name_, static_cast<int>(status_map_[dns_name_.c_str()]));
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "dns name {} timeout {}", dns_name_, static_cast<int>(timeout_map_[dns_name_.c_str()]));
+          ares_addrinfo *addrinfo_value = new ares_addrinfo();
+          addrinfo_value = address_info_map_[dns_name_.c_str()];
+          ares_addrinfo_node *addrinfo_node = new ares_addrinfo_node();
+          ares_addrinfo_cname *addrinfo_cname = new ares_addrinfo_cname();
+          addrinfo_node = address_info_nodes_map_[dns_name_.c_str()];
+          addrinfo_cname = address_info_cnames_map_[dns_name_.c_str()];
+          addrinfo_value->nodes = addrinfo_node;
+          addrinfo_value->cnames = addrinfo_cname;
+          addrinfo_value->name = address_info_name_map_[dns_name_.c_str()];
+          static_cast<AddrInfoPendingResolution*>(this)->onAresGetAddrInfoCallback(status_map_[dns_name_.c_str()], timeout_map_[dns_name_.c_str()],
+                                    addrinfo_value);
+          return;
+        } else {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting cache");
+          dns_resolution_cache_ = "";
+          start = time(0);
+          if (status_map_.count(dns_name_.c_str())) {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting status cache for dns {}", dns_name_);
+            status_map_.erase(dns_name_.c_str());
+          } else {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "unable to reset status cache for dns {}", dns_name_);
+          }
+          if (timeout_map_.count(dns_name_.c_str())) {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting timeout cache for dns {}", dns_name_);
+            timeout_map_.erase(dns_name_.c_str());
+          } else {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "unable to reset timeout cache for dns {}", dns_name_);
+          }
+          if (address_info_map_.count(dns_name_.c_str())) {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting address info cache for dns {}", dns_name_);
+            address_info_map_.erase(dns_name_.c_str());
+          } else {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "unable to reset address info cache for dns {}", dns_name_);
+          }
+          if (address_info_nodes_map_.count(dns_name_.c_str())) {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting address_info_nodes_map_ cache for dns {}", dns_name_);
+            address_info_nodes_map_.erase(dns_name_.c_str());
+          } else {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "unable to reset address_info_nodes_map_ cache for dns {}", dns_name_);
+          }
+          if (address_info_cnames_map_.count(dns_name_.c_str())) {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting address_info_cnames_map_ cache for dns {}", dns_name_);
+            address_info_cnames_map_.erase(dns_name_.c_str());
+          } else {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "unable to reset address_info_cnames_map_ cache for dns {}", dns_name_);
+          }
+          if (address_info_name_map_.count(dns_name_.c_str())) {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "resetting address_info_name_map_ cache for dns {}", dns_name_);
+            address_info_name_map_.erase(dns_name_.c_str());
+          } else {
+            ENVOY_LOG_EVENT(debug, "cares_aaeron", "unable to reset address_info_name_map_ cache for dns {}", dns_name_);
+          }
+        }
+      } else {
+          ENVOY_LOG_EVENT(debug, "cares_aaeron", " dns name {} was in cache, but did not have a success status. will call dns resolution", dns_name_);
+      }
+    }
+  }
+
+  if (strstr(dns_name_.c_str(), "internal")) {
+    ENVOY_LOG_EVENT(debug, "cares_aaeron", "adding dns name {} to dns resolution", dns_name_);
+    dns_resolution_cache_.append(dns_name_.c_str());
+  }
+
+  ENVOY_LOG_EVENT(debug, "cares_aaeron", "starting DNS resolution for {} domain", dns_name_);
 
   ares_getaddrinfo(
       channel_, dns_name_.c_str(), /* service */ nullptr, &hints,
